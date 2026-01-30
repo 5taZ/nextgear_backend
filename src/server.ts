@@ -9,18 +9,30 @@ dotenv.config();
 const { Pool } = pg;
 const app = express();
 
+// ==========================================
 // Middleware
-app.use(cors());
+// ==========================================
+
+// CORS для Netlify и локальной разработки
+app.use(cors({
+  origin: ['https://nextgearstore.netlify.app', 'http://localhost:5173', 'http://localhost:3000'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Telegram-Init-Data'],
+  credentials: true
+}));
+
 app.use(express.json());
 
-// PostgreSQL connection pool
+// ==========================================
+// Database
+// ==========================================
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
-// Test database connection
-pool.query('SELECT NOW()', (err, res) => {
+pool.query('SELECT NOW()', (err) => {
   if (err) {
     console.error('❌ Database connection failed:', err);
   } else {
@@ -28,12 +40,10 @@ pool.query('SELECT NOW()', (err, res) => {
   }
 });
 
-// ============== TELEGRAM VALIDATION ==============
+// ==========================================
+// Telegram Validation
+// ==========================================
 
-/**
- * Валидация initData от Telegram WebApp
- * Проверяет HMAC-SHA256 подпись
- */
 function validateTelegramData(initData: string): { valid: boolean; user?: any } {
   if (!initData || !process.env.BOT_TOKEN) {
     return { valid: false };
@@ -49,30 +59,25 @@ function validateTelegramData(initData: string): { valid: boolean; user?: any } 
 
     params.delete('hash');
 
-    // Сортируем параметры по ключу
     const dataCheckString = Array.from(params.entries())
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => `${key}=${value}`)
       .join('\n');
 
-    // Создаем секретный ключ
     const secretKey = crypto
       .createHmac('sha256', 'WebAppData')
       .update(process.env.BOT_TOKEN)
       .digest();
 
-    // Вычисляем хеш
     const checkHash = crypto
       .createHmac('sha256', secretKey)
       .update(dataCheckString)
       .digest('hex');
 
-    // Безопасное сравнение хешей
     if (!crypto.timingSafeEqual(Buffer.from(checkHash), Buffer.from(hash))) {
       return { valid: false };
     }
 
-    // Парсим пользователя
     const userJson = params.get('user');
     if (!userJson) {
       return { valid: false };
@@ -86,14 +91,10 @@ function validateTelegramData(initData: string): { valid: boolean; user?: any } 
   }
 }
 
-/**
- * Middleware для проверки авторизации
- */
-async function requireAuth(req: Request, res: Response, next: NextFunction) {
+function requireAuth(req: Request, res: Response, next: NextFunction) {
   const initData = req.body?.init_data || req.headers['x-telegram-init-data'];
   
   if (!initData && process.env.NODE_ENV === 'development') {
-    // В режиме разработки пропускаем без проверки (опционально)
     return next();
   }
 
@@ -103,105 +104,90 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
     return res.status(401).json({ error: 'Unauthorized: Invalid Telegram data' });
   }
 
-  // Добавляем пользователя в запрос для использования в роутах
   (req as any).telegramUser = user;
   next();
 }
 
-/**
- * Middleware для проверки прав администратора
- */
-async function requireAdmin(req: Request, res: Response, next: NextFunction) {
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const initData = req.body?.init_data || req.headers['x-telegram-init-data'];
-  const { valid, user } = validateTelegramData(initData);
   
-  if (!valid && process.env.NODE_ENV !== 'development') {
+  if (!initData && process.env.NODE_ENV === 'development') {
+    return next();
+  }
+
+  const { valid, user: tgUser } = validateTelegramData(initData);
+  
+  if (!valid) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  const tgUser = user || (req as any).telegramUser;
-  
-  if (!tgUser) {
-    return res.status(401).json({ error: 'User not found' });
-  }
-
-  // Проверяем, является ли пользователь админом
   const isAdmin = 
     tgUser.username === process.env.ADMIN_TELEGRAM_USERNAME ||
     tgUser.id.toString() === process.env.ADMIN_TELEGRAM_ID;
 
-  if (!isAdmin && process.env.NODE_ENV !== 'development') {
+  if (!isAdmin) {
     return res.status(403).json({ error: 'Forbidden: Admin only' });
   }
 
   (req as any).isAdmin = true;
+  (req as any).telegramUser = tgUser;
   next();
 }
 
-// ============== HEALTH CHECK ==============
+// ==========================================
+// Routes
+// ==========================================
+
+// Health check
 app.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ============== USER ENDPOINTS ==============
+// ============== USERS ==============
 
-// Get or create user (с валидацией Telegram)
 app.post('/api/users', async (req: Request, res: Response) => {
-  const { init_data } = req.body;
+  const { telegram_id, username, init_data } = req.body;
   
-  // Валидация Telegram данных
   const { valid, user: tgUser } = validateTelegramData(init_data);
   
-  if (!valid) {
-    // В режиме разработки можно пропустить (но не в production!)
-    if (process.env.NODE_ENV === 'development' && req.body.telegram_id) {
-      console.log('⚠️ Development mode: skipping Telegram validation');
-      // Для dev режима используем данные из body
-    } else {
-      return res.status(401).json({ error: 'Invalid Telegram signature' });
-    }
+  if (!valid && process.env.NODE_ENV !== 'development') {
+    return res.status(401).json({ error: 'Invalid Telegram signature' });
   }
 
-  // Используем данные из Telegram или fallback для dev
-  const telegramId = tgUser?.id || req.body.telegram_id;
-  const username = tgUser?.username || req.body.username || `user_${telegramId}`;
+  const finalTelegramId = tgUser?.id || telegram_id;
+  const finalUsername = tgUser?.username || username || `user_${finalTelegramId}`;
   
-  // Определяем админа ТОЛЬКО по проверенным данным Telegram или env
   const isAdmin = 
     tgUser?.username === process.env.ADMIN_TELEGRAM_USERNAME ||
-    telegramId?.toString() === process.env.ADMIN_TELEGRAM_ID ||
-    (process.env.NODE_ENV === 'development' && req.body.is_admin); // Только для dev
+    finalTelegramId?.toString() === process.env.ADMIN_TELEGRAM_ID ||
+    (process.env.NODE_ENV === 'development' && req.body.is_admin);
 
   try {
-    // Check if user exists
     let result = await pool.query(
       'SELECT * FROM users WHERE telegram_id = $1',
-      [telegramId]
+      [finalTelegramId]
     );
     
     if (result.rows.length === 0) {
-      // Create new user
       result = await pool.query(
         'INSERT INTO users (telegram_id, username, is_admin, balance, referrals) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [telegramId, username, isAdmin, 0, 0]
+        [finalTelegramId, finalUsername, isAdmin, 0, 0]
       );
-      console.log('✅ New user created:', username, 'Admin:', isAdmin);
+      console.log('✅ New user created:', finalUsername);
     } else {
-      // Обновляем username если изменился
-      if (result.rows[0].username !== username) {
+      if (result.rows[0].username !== finalUsername) {
         result = await pool.query(
           'UPDATE users SET username = $1 WHERE telegram_id = $2 RETURNING *',
-          [username, telegramId]
+          [finalUsername, finalTelegramId]
         );
       }
-      console.log('✅ User found:', username);
+      console.log('✅ User found:', finalUsername);
     }
     
-    // Возвращаем user с флагом is_admin
     const user = result.rows[0];
     res.json({
       ...user,
-      is_admin: user.is_admin || isAdmin // Убеждаемся что флаг актуальный
+      is_admin: user.is_admin || isAdmin
     });
   } catch (error) {
     console.error('❌ User error:', error);
@@ -209,9 +195,8 @@ app.post('/api/users', async (req: Request, res: Response) => {
   }
 });
 
-// ============== PRODUCT ENDPOINTS ==============
+// ============== PRODUCTS ==============
 
-// Get all products (публично)
 app.get('/api/products', async (req: Request, res: Response) => {
   try {
     const result = await pool.query(
@@ -224,7 +209,6 @@ app.get('/api/products', async (req: Request, res: Response) => {
   }
 });
 
-// Add product (только админ + проверка Telegram)
 app.post('/api/products', requireAdmin, async (req: Request, res: Response) => {
   const { name, price, image, description, category, in_stock } = req.body;
   
@@ -241,25 +225,6 @@ app.post('/api/products', requireAdmin, async (req: Request, res: Response) => {
   }
 });
 
-// Update product (только админ)
-app.patch('/api/products/:id', requireAdmin, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { name, price, image, description, category, in_stock } = req.body;
-  
-  try {
-    const result = await pool.query(
-      'UPDATE products SET name = COALESCE($1, name), price = COALESCE($2, price), image = COALESCE($3, image), description = COALESCE($4, description), category = COALESCE($5, category), in_stock = COALESCE($6, in_stock) WHERE id = $7 RETURNING *',
-      [name, price, image, description, category, in_stock, id]
-    );
-    console.log('✅ Product updated:', id);
-    res.json(result.rows[0]);
-  } catch (error) {
-    console.error('❌ Product update error:', error);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// Delete product (только админ)
 app.delete('/api/products/:id', requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
   
@@ -273,9 +238,9 @@ app.delete('/api/products/:id', requireAdmin, async (req: Request, res: Response
   }
 });
 
-// ============== ORDER ENDPOINTS ==============
+// ============== ORDERS ==============
 
-// Get all orders (только админ)
+// Get all orders (admin only)
 app.get('/api/orders', requireAdmin, async (req: Request, res: Response) => {
   try {
     const result = await pool.query(`
@@ -290,7 +255,7 @@ app.get('/api/orders', requireAdmin, async (req: Request, res: Response) => {
           json_agg(
             json_build_object(
               'id', p.id,
-              'name', COALESCE(p.name, oi.product_name),
+              'name', oi.product_name,
               'price', oi.price,
               'quantity', oi.quantity,
               'image', COALESCE(p.image, '')
@@ -312,22 +277,16 @@ app.get('/api/orders', requireAdmin, async (req: Request, res: Response) => {
   }
 });
 
-// Get user orders (с проверкой Telegram)
+// Get user orders
 app.get('/api/orders/user/:userId', async (req: Request, res: Response) => {
   const { userId } = req.params;
   const initData = req.headers['x-telegram-init-data'] as string;
-  
-  // Проверяем, что пользователь запрашивает свои заказы
-  const { valid, user: tgUser } = validateTelegramData(initData);
-  
-  if (!valid && process.env.NODE_ENV !== 'development') {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
   
   try {
     const result = await pool.query(`
       SELECT 
         o.id,
+        o.user_id,
         o.total_amount,
         o.status,
         o.created_at,
@@ -335,7 +294,7 @@ app.get('/api/orders/user/:userId', async (req: Request, res: Response) => {
           json_agg(
             json_build_object(
               'id', p.id,
-              'name', COALESCE(p.name, oi.product_name),
+              'name', oi.product_name,
               'price', oi.price,
               'quantity', oi.quantity,
               'image', COALESCE(p.image, '')
@@ -357,11 +316,10 @@ app.get('/api/orders/user/:userId', async (req: Request, res: Response) => {
   }
 });
 
-// Create order (с проверкой Telegram)
+// Create order - сразу удаляет товары из ассортимента (резервирование)
 app.post('/api/orders', async (req: Request, res: Response) => {
   const { user_id, items, total_amount, init_data } = req.body;
   
-  // Валидация Telegram (убеждаемся что заказ делает реальный пользователь)
   const { valid, user: tgUser } = validateTelegramData(init_data);
   
   if (!valid && process.env.NODE_ENV !== 'development') {
@@ -373,19 +331,7 @@ app.post('/api/orders', async (req: Request, res: Response) => {
   try {
     await client.query('BEGIN');
     
-    // Проверяем что user_id соответствует telegram_id из initData
-    if (valid && tgUser) {
-      const userCheck = await client.query(
-        'SELECT id FROM users WHERE id = $1 AND telegram_id = $2',
-        [user_id, tgUser.id]
-      );
-      if (userCheck.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ error: 'User ID mismatch' });
-      }
-    }
-    
-    // Create order
+    // Создаем заказ
     const orderResult = await client.query(
       'INSERT INTO orders (user_id, total_amount, status) VALUES ($1, $2, $3) RETURNING *',
       [user_id, total_amount, 'PENDING']
@@ -394,12 +340,23 @@ app.post('/api/orders', async (req: Request, res: Response) => {
     const orderId = orderResult.rows[0].id;
     console.log('✅ Order created:', orderId);
     
-    // Add order items
+    // Добавляем items и собираем ID для удаления
+    const productIds = [];
     for (const item of items) {
       await client.query(
         'INSERT INTO order_items (order_id, product_id, product_name, quantity, price) VALUES ($1, $2, $3, $4, $5)',
         [orderId, item.id, item.name, item.quantity, item.price]
       );
+      productIds.push(item.id);
+    }
+    
+    // СРАЗУ УДАЛЯЕМ ТОВАРЫ ИЗ АССОРТИМЕНТА (резервирование)
+    if (productIds.length > 0) {
+      await client.query(
+        'DELETE FROM products WHERE id = ANY($1)',
+        [productIds]
+      );
+      console.log(`✅ Reserved ${productIds.length} products for order ${orderId}`);
     }
     
     await client.query('COMMIT');
@@ -413,7 +370,7 @@ app.post('/api/orders', async (req: Request, res: Response) => {
   }
 });
 
-// Update order status (только админ)
+// Update order status - при отмене возвращает товары
 app.patch('/api/orders/:id', requireAdmin, async (req: Request, res: Response) => {
   const { id } = req.params;
   const { status } = req.body;
@@ -423,30 +380,46 @@ app.patch('/api/orders/:id', requireAdmin, async (req: Request, res: Response) =
   try {
     await client.query('BEGIN');
     
-    // Update order status
+    const currentOrder = await client.query(
+      'SELECT status FROM orders WHERE id = $1',
+      [id]
+    );
+    
+    if (currentOrder.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    // Обновляем статус
     const result = await client.query(
       'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
       [status, id]
     );
     
-    console.log(`✅ Order ${id} status updated to: ${status}`);
-    
-    // If approved, remove items from inventory
-    if (status === 'CONFIRMED') {
+    // ЕСЛИ ОТМЕНЯЕМ (CANCELED) - возвращаем товары в ассортимент
+    if (status === 'CANCELED') {
       const orderItems = await client.query(
-        'SELECT product_id FROM order_items WHERE order_id = $1',
+        'SELECT product_id, product_name, price FROM order_items WHERE order_id = $1',
         [id]
       );
       
-      const productIds = orderItems.rows.map((item: any) => item.product_id);
-      
-      if (productIds.length > 0) {
+      // Восстанавливаем товары
+      // Примечание: так как старые товары удалены, создаем новые с сохраненными данными
+      // Для полного восстановления (image, category, desc) нужно хранить их в order_items
+      for (const item of orderItems.rows) {
         await client.query(
-          'DELETE FROM products WHERE id = ANY($1)',
-          [productIds]
+          `INSERT INTO products (name, price, image, description, category, in_stock) 
+           VALUES ($1, $2, $3, $4, $5, true)`,
+          [
+            item.product_name, 
+            item.price, 
+            '', // image - placeholder (лучше хранить в order_items)
+            'Returned from order', 
+            'General'
+          ]
         );
-        console.log(`✅ Removed ${productIds.length} products from inventory`);
       }
+      console.log(`✅ Returned ${orderItems.rows.length} products to inventory`);
     }
     
     await client.query('COMMIT');
@@ -460,17 +433,18 @@ app.patch('/api/orders/:id', requireAdmin, async (req: Request, res: Response) =
   }
 });
 
-// ============== START SERVER ==============
+// ==========================================
+// Server Start
+// ==========================================
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📡 API endpoint: http://localhost:${PORT}/api`);
-  console.log(`🔐 Telegram validation: ${process.env.BOT_TOKEN ? 'ENABLED' : 'DISABLED (set BOT_TOKEN)'}`);
+  console.log(`🔐 Telegram validation: ${process.env.BOT_TOKEN ? 'ENABLED' : 'DISABLED'}`);
   console.log(`👑 Admin user: ${process.env.ADMIN_TELEGRAM_USERNAME || process.env.ADMIN_TELEGRAM_ID || 'NOT SET'}`);
 });
 
-// Handle graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, closing server...');
   await pool.end();
