@@ -221,7 +221,7 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// ✅ НОВОЕ: Обновление товара с логированием и преобразованием quantity
+// ✅ ИСПРАВЛЕНО: Убрана колонка updated_at (её нет в таблице)
 app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, price, image, description, category, quantity } = req.body;
@@ -276,9 +276,10 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     
     values.push(id);
     
+    // ✅ ИСПРАВЛЕНО: Убрано updated_at = NOW() - её нет в таблице products
     const query = `
       UPDATE products 
-      SET ${fields.join(', ')}, updated_at = NOW() 
+      SET ${fields.join(', ')} 
       WHERE id = $${paramIndex} 
       RETURNING *
     `;
@@ -364,7 +365,7 @@ app.post('/api/orders', async (req, res) => {
   // Валидация входных данных
   if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
     console.error('❌ Invalid order data');
-    return res.status(400).json({ error: 'Invalid order data' }); // ✅ ИСПРАВЛЕНО: 400 вместо 40json
+    return res.status(400).json({ error: 'Invalid order data' });
   }
   
   const { valid } = validateTelegramData(init_data);
