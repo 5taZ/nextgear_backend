@@ -221,10 +221,21 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// ✅ НОВОЕ: Обновление товара
+// ✅ НОВОЕ: Обновление товара с логированием и преобразованием quantity
 app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, price, image, description, category, quantity } = req.body;
+  
+  console.log('🔄 PATCH /api/products/:id called:', { 
+    id, 
+    name, 
+    price, 
+    image: !!image, 
+    description: !!description, 
+    category, 
+    quantity,
+    has_init_ !!req.body.init_data
+  });
   
   try {
     const fields: string[] = [];
@@ -253,10 +264,14 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     }
     if (quantity !== undefined) {
       fields.push(`quantity = $${paramIndex++}`);
-      values.push(quantity);
+      // ✅ ИСПРАВЛЕНО: Преобразуем в число на стороне сервера
+      const quantityNum = Number(quantity);
+      values.push(quantityNum);
+      console.log('📦 Converting quantity to number:', quantity, '→', quantityNum);
     }
     
     if (fields.length === 0) {
+      console.warn('⚠️ No fields to update');
       return res.status(400).json({ error: 'No fields to update' });
     }
     
@@ -269,18 +284,24 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
       RETURNING *
     `;
     
+    console.log('📦 Executing query:', query);
+    console.log('📦 Query values:', values);
+    
     const result = await pool.query(query, values);
     
     if (result.rows.length === 0) {
+      console.error('❌ Product not found:', id);
       return res.status(404).json({ error: 'Product not found' });
     }
     
     invalidateCache();
-    console.log('✅ Product updated:', id);
+    console.log('✅ Product updated successfully:', id, result.rows[0]);
     res.json(result.rows[0]);
-  } catch (error) {
+  } catch (error: any) {
     console.error('❌ Product update error:', error);
-    res.status(500).json({ error: 'Database error' });
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ error: 'Database error', details: error.message });
   }
 });
 
@@ -506,7 +527,7 @@ app.post('/api/product-requests', async (req, res) => {
     product_name, 
     quantity, 
     image,
-    has_init_data: !!init_data
+    has_init_ !!init_data
   });
   
   // Проверяем наличие данных
