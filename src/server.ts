@@ -221,7 +221,7 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Убрана колонка updated_at (её нет в таблице)
+// ✅ ИСПРАВЛЕНО: Обновление товара БЕЗ колонки updated_at
 app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, price, image, description, category, quantity } = req.body;
@@ -276,7 +276,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     
     values.push(id);
     
-    // ✅ ИСПРАВЛЕНО: Убрано updated_at = NOW() - её нет в таблице products
+    // ✅ УБРАНО: updated_at = NOW() (колонки нет в таблице)
     const query = `
       UPDATE products 
       SET ${fields.join(', ')} 
@@ -449,7 +449,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// PATCH update order status (админ может подтвердить ИЛИ отклонить, товары НЕ возвращаются)
+// ✅ НОВОЕ: Создание уведомления при обновлении статуса заказа
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
@@ -468,8 +468,8 @@ app.patch('/api/orders/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Проверяем права
-    const orderCheck = await client.query('SELECT user_id, status FROM orders WHERE id = $1', [id]);
+    // Получаем текущий заказ
+    const orderCheck = await client.query('SELECT id, user_id, status, total_amount FROM orders WHERE id = $1', [id]);
     if (orderCheck.rows.length === 0) {
       await client.query('ROLLBACK');
       console.error('❌ Order not found:', id);
@@ -489,21 +489,33 @@ app.patch('/api/orders/:id', async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
     
-    // Обновляем статус
+    // Обновляем статус заказа
     const result = await client.query(
       'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
       [status, id]
     );
     
-    // ⚠️ ВАЖНО: Товары НЕ возвращаются при отклонении (новая упрощённая логика)
-    // При отклонении админом или пользователем - товары остаются удалёнными/уменьшенными
+    // ✅ СОЗДАЕМ УВЕДОМЛЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ (только если статус изменился)
+    if (status === 'CONFIRMED' || status === 'CANCELED') {
+      const notificationType = status === 'CONFIRMED' ? 'order_confirmed' : 'order_canceled';
+      const notificationTitle = status === 'CONFIRMED' ? 'Заказ одобрен' : 'Заказ отменен';
+      const notificationMessage = `Ваш заказ №${id} ${status === 'CONFIRMED' ? 'одобрен' : 'отменен'}`;
+      
+      await client.query(
+        `INSERT INTO notifications (user_id, type, title, message, order_id, is_read) 
+         VALUES ($1, $2, $3, $4, $5, false)`,
+        [order.user_id, notificationType, notificationTitle, notificationMessage, id]
+      );
+      
+      console.log(`🔔 Notification created for user ${order.user_id}: ${notificationMessage}`);
+    }
     
     await client.query('COMMIT');
     
     if (status === 'CONFIRMED') {
       console.log(`✅ Order ${id} confirmed by ${isAdmin ? 'admin' : 'user'}`);
     } else if (status === 'CANCELED') {
-      console.log(`❌ Order ${id} ${isAdmin ? 'rejected by admin' : 'canceled by user'} (products NOT returned)`);
+      console.log(`❌ Order ${id} ${isAdmin ? 'rejected by admin' : 'canceled by user'}`);
     }
     
     res.json(result.rows[0]);
@@ -691,6 +703,51 @@ app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error('❌ Product request update error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ============== NOTIFICATIONS ==============
+
+// ✅ НОВОЕ: Получение уведомлений пользователя
+app.get('/api/notifications', async (req, res) => {
+  const { valid, user: tgUser } = validateTelegramData(req.headers['x-telegram-init-data'] as string);
+  
+  if (!valid && process.env.NODE_ENV !== 'development') {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    const userId = tgUser?.id;
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID not found' });
+    }
+    
+    const result = await pool.query(
+      `SELECT * FROM notifications 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC 
+       LIMIT 50`,
+      [userId]
+    );
+    
+    // Помечаем уведомления как прочитанные
+    await pool.query(
+      'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false',
+      [userId]
+    );
+    
+    res.json(result.rows.map(n => ({
+      id: n.id.toString(),
+      type: n.type,
+      title: n.title,
+      message: n.message,
+      orderId: n.order_id ? n.order_id.toString() : undefined,
+      isRead: n.is_read,
+      createdAt: new Date(n.created_at).getTime()
+    })));
+  } catch (error) {
+    console.error('❌ Notifications fetch error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
