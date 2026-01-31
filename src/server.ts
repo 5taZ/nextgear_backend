@@ -430,6 +430,7 @@ app.patch('/api/orders/:id', async (req, res) => {
 
 // ============== PRODUCT REQUESTS ==============
 
+// Создание запроса на товар
 app.post('/api/product-requests', async (req, res) => {
   const { user_id, product_name, quantity, image, init_data } = req.body;
   
@@ -453,12 +454,20 @@ app.post('/api/product-requests', async (req, res) => {
     const username = userResult.rows[0].username;
     
     // Сохраняем запрос в базу данных
-    // (Здесь можно создать отдельную таблицу или отправить уведомление админу)
+    const result = await pool.query(
+      `INSERT INTO product_requests (user_id, username, product_name, quantity, image, status) 
+       VALUES ($1, $2, $3, $4, $5, 'pending') 
+       RETURNING *`,
+      [user_id, username, product_name, quantity, image]
+    );
     
-    // Отправляем уведомление админу (можно через Telegram Bot API)
-    console.log(`🔔 Admin notification: User @${username} requested "${product_name}" x${quantity}`);
+    console.log(`🔔 New product request created: ${result.rows[0].id}`);
     
-    res.json({ success: true, message: 'Product request sent to admin' });
+    res.json({
+      success: true,
+      message: 'Product request sent to admin',
+      requestId: result.rows[0].id
+    });
   } catch (error) {
     console.error('❌ Product request error:', error);
     res.status(500).json({ error: 'Database error' });
@@ -468,11 +477,108 @@ app.post('/api/product-requests', async (req, res) => {
 // Получение всех запросов товаров (для админа)
 app.get('/api/product-requests', requireAdmin, async (req, res) => {
   try {
-    // Здесь можно получить все запросы из БД
-    // Пока возвращаем пустой массив
-    res.json([]);
+    const result = await pool.query(
+      `SELECT * FROM product_requests 
+       ORDER BY created_at DESC 
+       LIMIT 100`
+    );
+    
+    res.json(result.rows.map(r => ({
+      id: r.id.toString(),
+      userId: r.user_id,
+      username: r.username,
+      productName: r.product_name,
+      quantity: r.quantity,
+      image: r.image,
+      status: r.status,
+      createdAt: new Date(r.created_at).getTime(),
+      processedAt: r.processed_at ? new Date(r.processed_at).getTime() : undefined
+    })));
   } catch (error) {
     console.error('❌ Product requests fetch error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Получение запросов конкретного пользователя
+app.get('/api/product-requests/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { valid } = validateTelegramData(req.headers['x-telegram-init-data'] as string);
+    
+    if (!valid && process.env.NODE_ENV !== 'development') {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const result = await pool.query(
+      `SELECT * FROM product_requests 
+       WHERE user_id = $1 
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+    
+    res.json(result.rows.map(r => ({
+      id: r.id.toString(),
+      userId: r.user_id,
+      username: r.username,
+      productName: r.product_name,
+      quantity: r.quantity,
+      image: r.image,
+      status: r.status,
+      createdAt: new Date(r.created_at).getTime(),
+      processedAt: r.processed_at ? new Date(r.processed_at).getTime() : undefined
+    })));
+  } catch (error) {
+    console.error('❌ User product requests fetch error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Обработка запроса (одобрение/отклонение)
+app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { status, init_data } = req.body;
+  
+  console.log('📝 Product request update:', { id, status });
+  
+  const { valid } = validateTelegramData(init_data);
+  
+  if (!valid && process.env.NODE_ENV !== 'development') {
+    console.error('❌ Unauthorized product request update');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  try {
+    // Получаем информацию о запросе
+    const requestResult = await pool.query(
+      'SELECT user_id, product_name, quantity FROM product_requests WHERE id = $1',
+      [id]
+    );
+    
+    if (requestResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Request not found' });
+    }
+    
+    const request = requestResult.rows[0];
+    
+    // Обновляем статус
+    const result = await pool.query(
+      `UPDATE product_requests 
+       SET status = $1, processed_at = NOW() 
+       WHERE id = $2 
+       RETURNING *`,
+      [status, id]
+    );
+    
+    console.log(`✅ Product request ${id} ${status === 'approved' ? 'approved' : 'rejected'}`);
+    
+    // Здесь можно добавить уведомление пользователю
+    // (пока просто логируем)
+    console.log(`🔔 User ${request.user_id} should be notified about ${status} request for "${request.product_name}"`);
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('❌ Product request update error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
