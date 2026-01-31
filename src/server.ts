@@ -15,7 +15,7 @@ const app = express();
 
 app.use(cors({
   origin: [
-    'https://frontendstore-production.up.railway.app/',
+    'https://frontendstore-production.up.railway.app',
     'http://localhost:5173', 
     'http://localhost:3000'
   ],
