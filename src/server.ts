@@ -14,7 +14,7 @@ const app = express();
 // ==========================================
 
 app.use(cors({
-  origin: ['regal-dango-667791.netlify.app', 'http://localhost:5173'],
+  origin: ['https://regal-dango-667791.netlify.app', 'http://localhost:5173'],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data']
 }));
