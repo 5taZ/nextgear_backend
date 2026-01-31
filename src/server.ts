@@ -14,7 +14,11 @@ const app = express();
 // ==========================================
 
 app.use(cors({
-  origin: ['hhttps://peppy-frangollo-b305dd.netlify.app', 'http://localhost:5173', 'http://localhost:3000'],
+  origin: [
+    'https://peppy-frangollo-b305dd.netlify.app', // ✅ Исправлено: убрана лишняя 'h' и пробелы
+    'http://localhost:5173', 
+    'http://localhost:3000'
+  ],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data'],
   credentials: true
