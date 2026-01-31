@@ -269,7 +269,7 @@ app.get('/api/orders/user/:userId', async (req, res) => {
 });
 
 // ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа + логика с quantity
-app.post('/api (req, res) => {
+app.post('/api/orders', async (req, res) => {
   const { user_id, items, total_amount, init_data } = req.body;
   
   console.log('📦 Order request:', { user_id, itemsCount: items?.length, total_amount });
@@ -349,7 +349,8 @@ app.post('/api (req, res) => {
     await client.query('ROLLBACK');
     console.error('❌ Order creation failed:', error);
     console.error('Error details:', {
-      message: (error as Error).message (error as Error).stack
+      message: (error as Error).message,
+      stack: (error as Error).stack
     });
     res.status(500).json({ 
       error: 'Failed to create order',
@@ -438,7 +439,7 @@ app.post('/api/product-requests', async (req, res) => {
     product_name, 
     quantity, 
     image,
-    has_init_ !!init_data
+    has_init_data: !!init_data
   });
   
   // Проверяем наличие данных
@@ -493,8 +494,9 @@ app.post('/api/product-requests', async (req, res) => {
   }
 });
 
-// Получение всех запросов товаров (для админа)
-app.get('/api/product-requests', requireAdmin, async (req, res) {
+// ✅ ИСПРАВЛЕНО: Добавлен try и стрелка =>
+app.get('/api/product-requests', requireAdmin, async (req, res) => {
+  try {
     const result = await pool.query(
       `SELECT * FROM product_requests 
        ORDER BY created_at DESC 
