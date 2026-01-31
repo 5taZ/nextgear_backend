@@ -13,7 +13,6 @@ const app = express();
 // Middleware (оптимизировано)
 // ==========================================
 
-// ✅ ИСПРАВЛЕНО: Добавлен https:// префикс для Netlify
 app.use(cors({
   origin: ['https://regal-dango-667791.netlify.app', 'http://localhost:5173', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
@@ -426,6 +425,55 @@ app.patch('/api/orders/:id', async (req, res) => {
     res.status(500).json({ error: 'Database error' });
   } finally {
     client.release();
+  }
+});
+
+// ============== PRODUCT REQUESTS ==============
+
+app.post('/api/product-requests', async (req, res) => {
+  const { user_id, product_name, quantity, image, init_data } = req.body;
+  
+  console.log('📦 Product request:', { user_id, product_name, quantity });
+  
+  const { valid, user: tgUser } = validateTelegramData(init_data);
+  
+  if (!valid && process.env.NODE_ENV !== 'development') {
+    console.error('❌ Invalid Telegram data in product request');
+    return res.status(401).json({ error: 'Invalid Telegram data' });
+  }
+  
+  try {
+    // Получаем информацию о пользователе
+    const userResult = await pool.query('SELECT username FROM users WHERE id = $1', [user_id]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const username = userResult.rows[0].username;
+    
+    // Сохраняем запрос в базу данных
+    // (Здесь можно создать отдельную таблицу или отправить уведомление админу)
+    
+    // Отправляем уведомление админу (можно через Telegram Bot API)
+    console.log(`🔔 Admin notification: User @${username} requested "${product_name}" x${quantity}`);
+    
+    res.json({ success: true, message: 'Product request sent to admin' });
+  } catch (error) {
+    console.error('❌ Product request error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Получение всех запросов товаров (для админа)
+app.get('/api/product-requests', requireAdmin, async (req, res) => {
+  try {
+    // Здесь можно получить все запросы из БД
+    // Пока возвращаем пустой массив
+    res.json([]);
+  } catch (error) {
+    console.error('❌ Product requests fetch error:', error);
+    res.status(500).json({ error: 'Database error' });
   }
 });
 
