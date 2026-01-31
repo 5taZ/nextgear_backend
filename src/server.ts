@@ -434,9 +434,23 @@ app.patch('/api/orders/:id', async (req, res) => {
 app.post('/api/product-requests', async (req, res) => {
   const { user_id, product_name, quantity, image, init_data } = req.body;
   
-  console.log('📦 Product request:', { user_id, product_name, quantity });
+  console.log('📦 Product request received:', { 
+    user_id, 
+    product_name, 
+    quantity, 
+    image,
+    has_init_ !!init_data
+  });
+  
+  // Проверяем наличие данных
+  if (!user_id || !product_name || !quantity) {
+    console.error('❌ Missing required fields');
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
   
   const { valid, user: tgUser } = validateTelegramData(init_data);
+  
+  console.log('🔐 Telegram validation:', valid ? '✅ Valid' : '❌ Invalid');
   
   if (!valid && process.env.NODE_ENV !== 'development') {
     console.error('❌ Invalid Telegram data in product request');
@@ -448,10 +462,12 @@ app.post('/api/product-requests', async (req, res) => {
     const userResult = await pool.query('SELECT username FROM users WHERE id = $1', [user_id]);
     
     if (userResult.rows.length === 0) {
+      console.error('❌ User not found:', user_id);
       return res.status(404).json({ error: 'User not found' });
     }
     
     const username = userResult.rows[0].username;
+    console.log('👤 User found:', username);
     
     // Сохраняем запрос в базу данных
     const result = await pool.query(
@@ -461,7 +477,11 @@ app.post('/api/product-requests', async (req, res) => {
       [user_id, username, product_name, quantity, image]
     );
     
-    console.log(`🔔 New product request created: ${result.rows[0].id}`);
+    console.log(`✅ Product request created successfully:`, {
+      id: result.rows[0].id,
+      productName: product_name,
+      quantity: quantity
+    });
     
     res.json({
       success: true,
@@ -482,6 +502,8 @@ app.get('/api/product-requests', requireAdmin, async (req, res) => {
        ORDER BY created_at DESC 
        LIMIT 100`
     );
+    
+    console.log('✅ Fetched product requests:', result.rows.length);
     
     res.json(result.rows.map(r => ({
       id: r.id.toString(),
@@ -516,6 +538,8 @@ app.get('/api/product-requests/user/:userId', async (req, res) => {
        ORDER BY created_at DESC`,
       [userId]
     );
+    
+    console.log('✅ Fetched user product requests:', result.rows.length);
     
     res.json(result.rows.map(r => ({
       id: r.id.toString(),
