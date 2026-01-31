@@ -15,7 +15,7 @@ const app = express();
 
 app.use(cors({
   origin: [
-    'https://peppy-frangollo-b305dd.netlify.app', // ✅ Исправлено: убрана лишняя 'h' и пробелы
+    'https://peppy-frangollo-b305dd.netlify.app',
     'http://localhost:5173', 
     'http://localhost:3000'
   ],
@@ -217,6 +217,69 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('❌ Product delete error:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// ✅ НОВОЕ: Обновление товара
+app.patch('/api/products/:id', requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, price, image, description, category, quantity } = req.body;
+  
+  try {
+    const fields: string[] = [];
+    const values: any[] = [];
+    let paramIndex = 1;
+    
+    if (name !== undefined) {
+      fields.push(`name = $${paramIndex++}`);
+      values.push(name);
+    }
+    if (price !== undefined) {
+      fields.push(`price = $${paramIndex++}`);
+      values.push(price);
+    }
+    if (image !== undefined) {
+      fields.push(`image = $${paramIndex++}`);
+      values.push(image);
+    }
+    if (description !== undefined) {
+      fields.push(`description = $${paramIndex++}`);
+      values.push(description);
+    }
+    if (category !== undefined) {
+      fields.push(`category = $${paramIndex++}`);
+      values.push(category);
+    }
+    if (quantity !== undefined) {
+      fields.push(`quantity = $${paramIndex++}`);
+      values.push(quantity);
+    }
+    
+    if (fields.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+    
+    values.push(id);
+    
+    const query = `
+      UPDATE products 
+      SET ${fields.join(', ')}, updated_at = NOW() 
+      WHERE id = $${paramIndex} 
+      RETURNING *
+    `;
+    
+    const result = await pool.query(query, values);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    
+    invalidateCache();
+    console.log('✅ Product updated:', id);
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('❌ Product update error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
