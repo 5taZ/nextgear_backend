@@ -365,7 +365,7 @@ app.post('/api/orders', async (req, res) => {
   // Валидация входных данных
   if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
     console.error('❌ Invalid order data');
-    return res.status(400).json({ error: 'Invalid order data' });
+    return res.status(40json({ error: 'Invalid order data' });
   }
   
   const { valid } = validateTelegramData(init_data);
