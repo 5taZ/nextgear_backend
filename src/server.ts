@@ -13,10 +13,12 @@ const app = express();
 // Middleware (оптимизировано)
 // ==========================================
 
+// ✅ ИСПРАВЛЕНО: Добавлен https:// префикс для Netlify
 app.use(cors({
-  origin: ['https://regal-dango-667791.netlify.app', 'http://localhost:5173'],
+  origin: ['https://regal-dango-667791.netlify.app', 'http://localhost:5173', 'http://localhost:3000'],
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data']
+  allowedHeaders: ['Content-Type', 'X-Telegram-Init-Data'],
+  credentials: true
 }));
 
 app.use(express.json({ limit: '10mb' }));
@@ -52,13 +54,13 @@ const invalidateCache = () => {
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20, // Увеличиваем пул соединений
+  max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected DB error', err);
+  console.error('❌ Unexpected DB error', err);
 });
 
 // ==========================================
@@ -91,6 +93,7 @@ function validateTelegramData(initData: string): { valid: boolean; user?: any } 
     
     return { valid: true, user: JSON.parse(params.get('user') || '{}') };
   } catch (error) {
+    console.error('❌ Telegram validation error:', error);
     return { valid: false };
   }
 }
@@ -100,7 +103,10 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   if (!initData && process.env.NODE_ENV === 'development') return next();
   
   const { valid, user } = validateTelegramData(initData);
-  if (!valid) return res.status(401).json({ error: 'Unauthorized' });
+  if (!valid) {
+    console.warn('⚠️ Unauthorized request');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   
   (req as any).telegramUser = user;
   next();
@@ -142,6 +148,7 @@ app.post('/api/users', async (req, res) => {
   const { valid, user: tgUser } = validateTelegramData(init_data);
   
   if (!valid && process.env.NODE_ENV !== 'development') {
+    console.warn('⚠️ Invalid user signature');
     return res.status(401).json({ error: 'Invalid signature' });
   }
 
@@ -152,7 +159,6 @@ app.post('/api/users', async (req, res) => {
     finalId?.toString() === process.env.ADMIN_TELEGRAM_ID;
 
   try {
-    // Используем UPSERT для скорости
     const result = await pool.query(
       `INSERT INTO users (telegram_id, username, is_admin) 
        VALUES ($1, $2, $3) 
@@ -162,26 +168,26 @@ app.post('/api/users', async (req, res) => {
       [finalId, finalUsername, isAdmin]
     );
     
+    console.log('✅ User authenticated:', finalUsername);
     res.json({ ...result.rows[0], is_admin: result.rows[0].is_admin || isAdmin });
   } catch (error) {
-    console.error('User error:', error);
+    console.error('❌ User error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
 // ============== PRODUCTS (с кэшем) ==============
 
-// Очень быстрый GET - из памяти, не из БД
 app.get('/api/products', async (req, res) => {
   try {
     const products = await getCachedProducts();
     res.json(products);
   } catch (error) {
+    console.error('❌ Products fetch error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// POST - добавление (с инвалидацией кэша)
 app.post('/api/products', requireAdmin, async (req, res) => {
   const { name, price, image, description, category } = req.body;
   
@@ -191,16 +197,15 @@ app.post('/api/products', requireAdmin, async (req, res) => {
       [name, price, image, description, category]
     );
     
-    invalidateCache(); // Сбрасываем кэш
+    invalidateCache();
     console.log('✅ Product added:', name);
     res.json(result.rows[0]);
   } catch (error) {
-    console.error('Product add error:', error);
+    console.error('❌ Product add error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// DELETE - удаление (с инвалидацией кэша)
 app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   try {
     await pool.query('DELETE FROM products WHERE id = $1', [req.params.id]);
@@ -208,13 +213,13 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
     console.log('✅ Product deleted:', req.params.id);
     res.json({ success: true });
   } catch (error) {
+    console.error('❌ Product delete error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
 // ============== ORDERS (Оптимизировано) ==============
 
-// GET all orders (admin) - без кэша, всегда свежие
 app.get('/api/orders', requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -235,12 +240,11 @@ app.get('/api/orders', requireAdmin, async (req, res) => {
     `);
     res.json(result.rows);
   } catch (error) {
-    console.error('Orders fetch error:', error);
+    console.error('❌ Orders fetch error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// GET user orders
 app.get('/api/orders/user/:userId', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -260,16 +264,26 @@ app.get('/api/orders/user/:userId', async (req, res) => {
     `, [req.params.userId]);
     res.json(result.rows);
   } catch (error) {
+    console.error('❌ User orders fetch error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-// POST create order - с резервированием (удаление из products)
+// ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа
 app.post('/api/orders', async (req, res) => {
   const { user_id, items, total_amount, init_data } = req.body;
   
+  console.log('📦 Order request:', { user_id, itemsCount: items?.length, total_amount });
+  
+  // Валидация входных данных
+  if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
+    console.error('❌ Invalid order data');
+    return res.status(400).json({ error: 'Invalid order data' });
+  }
+  
   const { valid } = validateTelegramData(init_data);
   if (!valid && process.env.NODE_ENV !== 'development') {
+    console.error('❌ Invalid Telegram data in order');
     return res.status(401).json({ error: 'Invalid Telegram data' });
   }
   
@@ -277,54 +291,70 @@ app.post('/api/orders', async (req, res) => {
   
   try {
     await client.query('BEGIN');
+    console.log('🔄 Transaction started');
     
-    // 1. Создаем заказ (быстро)
+    // 1. Создаем заказ
     const orderResult = await client.query(
       'INSERT INTO orders (user_id, total_amount, status) VALUES ($1, $2, $3) RETURNING *',
       [user_id, total_amount, 'PENDING']
     );
     const orderId = orderResult.rows[0].id;
+    console.log('✅ Order created:', orderId);
     
-    // 2. Сохраняем items с image_data для возможности возврата
+    // 2. Сохраняем items с image_data
     for (const item of items) {
       await client.query(
         'INSERT INTO order_items (order_id, product_id, product_name, quantity, price, image_data) VALUES ($1, $2, $3, $4, $5, $6)',
         [orderId, item.id, item.name, item.quantity, item.price, item.image || '']
       );
     }
+    console.log('✅ Order items saved:', items.length);
     
-    // 3. Удаляем из products (резервирование) - одним запросом
+    // 3. Удаляем из products (резервирование)
     if (items.length > 0) {
-      await client.query(
-        'DELETE FROM products WHERE id = ANY($1)',
-        [items.map((i: any) => i.id)]
+      const productIds = items.map((i: any) => i.id);
+      const deleteResult = await client.query(
+        'DELETE FROM products WHERE id = ANY($1) RETURNING id',
+        [productIds]
       );
+      console.log('✅ Products reserved:', deleteResult.rowCount);
     }
     
     await client.query('COMMIT');
+    console.log('✅ Transaction committed');
     
-    // 4. Инвалидируем кэш продуктов (чтобы фронт получил актуальный список)
+    // 4. Инвалидируем кэш продуктов
     invalidateCache();
     
-    console.log(`✅ Order ${orderId} created, ${items.length} items reserved`);
+    console.log(`🎉 Order ${orderId} created successfully`);
     res.json(orderResult.rows[0]);
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Order creation error:', error);
-    res.status(500).json({ error: 'Database error' });
+    console.error('❌ Order creation failed:', error);
+    console.error('Error details:', {
+      message: (error as Error).message,
+      stack: (error as Error).stack
+    });
+    res.status(500).json({ 
+      error: 'Failed to create order',
+      details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
+    });
   } finally {
     client.release();
   }
 });
 
-// PATCH update order status - с возвратом товаров при отмене
+// PATCH update order status
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
   
+  console.log('📝 Order status update:', { id, status, user_id });
+  
   const { valid, user: tgUser } = validateTelegramData(init_data);
   
   if (!valid && process.env.NODE_ENV !== 'development') {
+    console.error('❌ Unauthorized order update');
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
@@ -337,6 +367,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     const orderCheck = await client.query('SELECT user_id, status FROM orders WHERE id = $1', [id]);
     if (orderCheck.rows.length === 0) {
       await client.query('ROLLBACK');
+      console.error('❌ Order not found:', id);
       return res.status(404).json({ error: 'Order not found' });
     }
     
@@ -348,6 +379,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     // Пользователь может только отменить свой PENDING заказ
     if (!isAdmin && (!isOwner || order.status !== 'PENDING' || status !== 'CANCELED')) {
       await client.query('ROLLBACK');
+      console.error('❌ Forbidden order update');
       return res.status(403).json({ error: 'Forbidden' });
     }
     
@@ -357,21 +389,25 @@ app.patch('/api/orders/:id', async (req, res) => {
       [status, id]
     );
     
-    // Если отмена - возвращаем товары в ассортимент
+    // Если отмена - возвращаем товары
     if (status === 'CANCELED') {
       const items = await client.query(
-        'SELECT product_name, price, image_data FROM order_items WHERE order_id = $1',
+        'SELECT product_name, price, image_data, product_id FROM order_items WHERE order_id = $1',
         [id]
       );
       
       for (const item of items.rows) {
-        await client.query(
-          'INSERT INTO products (name, price, image, description, category, in_stock) VALUES ($1, $2, $3, $4, $5, true)',
-          [item.product_name, item.price, item.image_data || '', 'Returned from order', 'General']
-        );
+        // Проверяем, не вернули ли товар уже
+        const existing = await client.query('SELECT id FROM products WHERE id = $1', [item.product_id]);
+        if (existing.rows.length === 0) {
+          await client.query(
+            'INSERT INTO products (id, name, price, image, description, category, in_stock) VALUES ($1, $2, $3, $4, $5, $6, true)',
+            [item.product_id, item.product_name, item.price, item.image_data || '', 'Returned from order', 'General']
+          );
+        }
       }
       
-      invalidateCache(); // Товары вернулись - сбрасываем кэш
+      invalidateCache();
       console.log(`✅ Order ${id} canceled, ${items.rows.length} items returned`);
     } else if (status === 'CONFIRMED') {
       console.log(`✅ Order ${id} confirmed`);
@@ -381,7 +417,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Order update error:', error);
+    console.error('❌ Order update error:', error);
     res.status(500).json({ error: 'Database error' });
   } finally {
     client.release();
@@ -394,6 +430,7 @@ app.patch('/api/orders/:id', async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
   console.log(`⚡ Cache enabled: ${CACHE_TTL}ms TTL`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
