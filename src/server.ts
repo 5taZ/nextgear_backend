@@ -110,7 +110,6 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     console.warn('⚠️ Unauthorized request');
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  
   (req as any).telegramUser = user;
   next();
 }
@@ -154,13 +153,10 @@ app.post('/api/users', async (req, res) => {
     console.warn('⚠️ Invalid user signature');
     return res.status(401).json({ error: 'Invalid signature' });
   }
-
   const finalId = tgUser?.id || telegram_id;
   const finalUsername = tgUser?.username || username || `user_${finalId}`;
-  
   const isAdmin = tgUser?.username === process.env.ADMIN_TELEGRAM_USERNAME ||
     finalId?.toString() === process.env.ADMIN_TELEGRAM_ID;
-
   try {
     const result = await pool.query(
       `INSERT INTO users (telegram_id, username, is_admin) 
@@ -170,7 +166,6 @@ app.post('/api/users', async (req, res) => {
        RETURNING *`,
       [finalId, finalUsername, isAdmin]
     );
-    
     console.log('✅ User authenticated:', finalUsername);
     res.json({ ...result.rows[0], is_admin: result.rows[0].is_admin || isAdmin });
   } catch (error) {
@@ -193,13 +188,11 @@ app.get('/api/products', async (req, res) => {
 
 app.post('/api/products', requireAdmin, async (req, res) => {
   const { name, price, image, description, category, quantity } = req.body;
-  
   try {
     const result = await pool.query(
       'INSERT INTO products (name, price, image, description, category, quantity, in_stock) VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING *',
       [name, price, image, description, category, quantity || 1]
     );
-    
     invalidateCache();
     console.log('✅ Product added:', name);
     res.json(result.rows[0]);
@@ -225,7 +218,6 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
 app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, price, image, description, category, quantity } = req.body;
-  
   console.log('🔄 PATCH /api/products/:id called:', { 
     id, 
     name, 
@@ -234,7 +226,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     description: !!description, 
     category, 
     quantity,
-    has_init_ !!req.body.init_data
+    has_init_data: !!req.body.init_data // ✅ ИСПРАВЛЕНО: добавлена недостающая запятая
   });
   
   try {
@@ -359,7 +351,6 @@ app.get('/api/orders/user/:userId', async (req, res) => {
 // ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа + логика с quantity
 app.post('/api/orders', async (req, res) => {
   const { user_id, items, total_amount, init_data } = req.body;
-  
   console.log('📦 Order request:', { user_id, itemsCount: items?.length, total_amount });
   
   // Валидация входных данных
@@ -449,11 +440,10 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// ✅ УДАЛЕНО: Создание уведомлений при обновлении статуса заказа
+// ✅ ИСПРАВЛЕНО: Обновление статуса заказа
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
-  
   console.log('📝 Order status update:', { id, status, user_id });
   
   const { valid, user: tgUser } = validateTelegramData(init_data);
@@ -521,7 +511,6 @@ app.patch('/api/orders/:id', async (req, res) => {
 // Создание запроса на товар
 app.post('/api/product-requests', async (req, res) => {
   const { user_id, product_name, quantity, image, init_data } = req.body;
-  
   console.log('📦 Product request received:', { 
     user_id, 
     product_name, 
@@ -650,7 +639,6 @@ app.get('/api/product-requests/user/:userId', async (req, res) => {
 app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status, init_data } = req.body;
-  
   console.log('📝 Product request update:', { id, status });
   
   const { valid } = validateTelegramData(init_data);
