@@ -234,7 +234,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     description: !!description, 
     category, 
     quantity,
-    has_init_data: !!req.body.init_data
+    has_init_ !!req.body.init_data
   });
   
   try {
@@ -449,7 +449,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// ✅ НОВОЕ: Создание уведомления при обновлении статуса заказа
+// ✅ УДАЛЕНО: Создание уведомлений при обновлении статуса заказа
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
@@ -495,20 +495,8 @@ app.patch('/api/orders/:id', async (req, res) => {
       [status, id]
     );
     
-    // ✅ СОЗДАЕМ УВЕДОМЛЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ (только если статус изменился)
-    if (status === 'CONFIRMED' || status === 'CANCELED') {
-      const notificationType = status === 'CONFIRMED' ? 'order_confirmed' : 'order_canceled';
-      const notificationTitle = status === 'CONFIRMED' ? 'Заказ одобрен' : 'Заказ отменен';
-      const notificationMessage = `Ваш заказ №${id} ${status === 'CONFIRMED' ? 'одобрен' : 'отменен'}`;
-      
-      await client.query(
-        `INSERT INTO notifications (user_id, type, title, message, order_id, is_read) 
-         VALUES ($1, $2, $3, $4, $5, false)`,
-        [order.user_id, notificationType, notificationTitle, notificationMessage, id]
-      );
-      
-      console.log(`🔔 Notification created for user ${order.user_id}: ${notificationMessage}`);
-    }
+    // ✅ УДАЛЕНО: Создание уведомлений
+    console.log(`🔔 Order ${id} status changed to ${status} for user ${order.user_id}`);
     
     await client.query('COMMIT');
     
@@ -703,51 +691,6 @@ app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error('❌ Product request update error:', error);
-    res.status(500).json({ error: 'Database error' });
-  }
-});
-
-// ============== NOTIFICATIONS ==============
-
-// ✅ НОВОЕ: Получение уведомлений пользователя
-app.get('/api/notifications', async (req, res) => {
-  const { valid, user: tgUser } = validateTelegramData(req.headers['x-telegram-init-data'] as string);
-  
-  if (!valid && process.env.NODE_ENV !== 'development') {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  try {
-    const userId = tgUser?.id;
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID not found' });
-    }
-    
-    const result = await pool.query(
-      `SELECT * FROM notifications 
-       WHERE user_id = $1 
-       ORDER BY created_at DESC 
-       LIMIT 50`,
-      [userId]
-    );
-    
-    // Помечаем уведомления как прочитанные
-    await pool.query(
-      'UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false',
-      [userId]
-    );
-    
-    res.json(result.rows.map(n => ({
-      id: n.id.toString(),
-      type: n.type,
-      title: n.title,
-      message: n.message,
-      orderId: n.order_id ? n.order_id.toString() : undefined,
-      isRead: n.is_read,
-      createdAt: new Date(n.created_at).getTime()
-    })));
-  } catch (error) {
-    console.error('❌ Notifications fetch error:', error);
     res.status(500).json({ error: 'Database error' });
   }
 });
