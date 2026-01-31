@@ -264,7 +264,6 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     }
     if (quantity !== undefined) {
       fields.push(`quantity = $${paramIndex++}`);
-      // ✅ ИСПРАВЛЕНО: Преобразуем в число на стороне сервера
       const quantityNum = Number(quantity);
       values.push(quantityNum);
       console.log('📦 Converting quantity to number:', quantity, '→', quantityNum);
@@ -365,7 +364,7 @@ app.post('/api/orders', async (req, res) => {
   // Валидация входных данных
   if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
     console.error('❌ Invalid order data');
-    return res.status(40json({ error: 'Invalid order data' });
+    return res.status(400).json({ error: 'Invalid order data' }); // ✅ ИСПРАВЛЕНО: 400 вместо 40json
   }
   
   const { valid } = validateTelegramData(init_data);
