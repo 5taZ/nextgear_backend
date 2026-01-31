@@ -234,7 +234,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     description: !!description, 
     category, 
     quantity,
-    has_init_ !!req.body.init_data
+    has_init_data: !!req.body.init_data
   });
   
   try {
@@ -365,7 +365,7 @@ app.post('/api/orders', async (req, res) => {
   // Валидация входных данных
   if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
     console.error('❌ Invalid order data');
-    return res.status(400).json({ error: 'Invalid order data' });
+    return res.status(40json({ error: 'Invalid order data' });
   }
   
   const { valid } = validateTelegramData(init_data);
@@ -527,7 +527,7 @@ app.post('/api/product-requests', async (req, res) => {
     product_name, 
     quantity, 
     image,
-    has_init_ !!init_data
+    has_init_data: !!init_data
   });
   
   // Проверяем наличие данных
