@@ -189,12 +189,12 @@ app.get('/api/products', async (req, res) => {
 });
 
 app.post('/api/products', requireAdmin, async (req, res) => {
-  const { name, price, image, description, category } = req.body;
+  const { name, price, image, description, category, quantity } = req.body;
   
   try {
     const result = await pool.query(
-      'INSERT INTO products (name, price, image, description, category, in_stock) VALUES ($1, $2, $3, $4, $5, true) RETURNING *',
-      [name, price, image, description, category]
+      'INSERT INTO products (name, price, image, description, category, quantity, in_stock) VALUES ($1, $2, $3, $4, $5, $6, true) RETURNING *',
+      [name, price, image, description, category, quantity || 1]
     );
     
     invalidateCache();
@@ -269,7 +269,7 @@ app.get('/api/orders/user/:userId', async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа
+// ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа + логика с quantity
 app.post('/api/orders', async (req, res) => {
   const { user_id, items, total_amount, init_data } = req.body;
   
@@ -310,14 +310,32 @@ app.post('/api/orders', async (req, res) => {
     }
     console.log('✅ Order items saved:', items.length);
     
-    // 3. Удаляем из products (резервирование)
-    if (items.length > 0) {
-      const productIds = items.map((i: any) => i.id);
-      const deleteResult = await client.query(
-        'DELETE FROM products WHERE id = ANY($1) RETURNING id',
-        [productIds]
+    // 3. Уменьшаем quantity товаров (НОВАЯ ЛОГИКА)
+    for (const item of items) {
+      const productResult = await client.query(
+        'SELECT quantity FROM products WHERE id = $1 FOR UPDATE',
+        [item.id]
       );
-      console.log('✅ Products reserved:', deleteResult.rowCount);
+      
+      if (productResult.rows.length === 0) {
+        throw new Error(`Product ${item.id} not found`);
+      }
+      
+      const currentQuantity = productResult.rows[0].quantity || 1;
+      const newQuantity = currentQuantity - item.quantity;
+      
+      if (newQuantity <= 0) {
+        // Удаляем товар если количество <= 0
+        await client.query('DELETE FROM products WHERE id = $1', [item.id]);
+        console.log(`🗑️ Product ${item.id} deleted (quantity reached 0)`);
+      } else {
+        // Уменьшаем количество
+        await client.query(
+          'UPDATE products SET quantity = $1 WHERE id = $2',
+          [newQuantity, item.id]
+        );
+        console.log(`📦 Product ${item.id} quantity updated: ${currentQuantity} → ${newQuantity}`);
+      }
     }
     
     await client.query('COMMIT');
@@ -344,7 +362,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// PATCH update order status
+// PATCH update order status (админ может подтвердить ИЛИ отклонить, товары НЕ возвращаются)
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
@@ -377,6 +395,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     const isOwner = order.user_id.toString() === user_id?.toString();
     
     // Пользователь может только отменить свой PENDING заказ
+    // Админ может менять статус на любой
     if (!isAdmin && (!isOwner || order.status !== 'PENDING' || status !== 'CANCELED')) {
       await client.query('ROLLBACK');
       console.error('❌ Forbidden order update');
@@ -389,31 +408,17 @@ app.patch('/api/orders/:id', async (req, res) => {
       [status, id]
     );
     
-    // Если отмена - возвращаем товары
-    if (status === 'CANCELED') {
-      const items = await client.query(
-        'SELECT product_name, price, image_data, product_id FROM order_items WHERE order_id = $1',
-        [id]
-      );
-      
-      for (const item of items.rows) {
-        // Проверяем, не вернули ли товар уже
-        const existing = await client.query('SELECT id FROM products WHERE id = $1', [item.product_id]);
-        if (existing.rows.length === 0) {
-          await client.query(
-            'INSERT INTO products (id, name, price, image, description, category, in_stock) VALUES ($1, $2, $3, $4, $5, $6, true)',
-            [item.product_id, item.product_name, item.price, item.image_data || '', 'Returned from order', 'General']
-          );
-        }
-      }
-      
-      invalidateCache();
-      console.log(`✅ Order ${id} canceled, ${items.rows.length} items returned`);
-    } else if (status === 'CONFIRMED') {
-      console.log(`✅ Order ${id} confirmed`);
-    }
+    // ⚠️ ВАЖНО: Товары НЕ возвращаются при отклонении (новая упрощённая логика)
+    // При отклонении админом или пользователем - товары остаются удалёнными/уменьшенными
     
     await client.query('COMMIT');
+    
+    if (status === 'CONFIRMED') {
+      console.log(`✅ Order ${id} confirmed by ${isAdmin ? 'admin' : 'user'}`);
+    } else if (status === 'CANCELED') {
+      console.log(`❌ Order ${id} ${isAdmin ? 'rejected by admin' : 'canceled by user'} (products NOT returned)`);
+    }
+    
     res.json(result.rows[0]);
   } catch (error) {
     await client.query('ROLLBACK');
