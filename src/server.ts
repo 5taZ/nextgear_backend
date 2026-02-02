@@ -15,7 +15,7 @@ const app = express();
 
 app.use(cors({
   origin: [
-    'https://frontendstore-production.up.railway.app', // ✅ УБРАНЫ ПРОБЕЛЫ
+    'https://frontendstore-production.up.railway.app',
     'http://localhost:5173', 
     'http://localhost:3000'
   ],
@@ -64,22 +64,27 @@ setInterval(() => {
 }, CACHE_TTL / 2);
 
 // ==========================================
-// Database
+// Database (оптимизированный пул)
 // ==========================================
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
-  max: 20,
-  min: 2,
+  max: 30, // Увеличено с 20
+  min: 5,  // Увеличено с 2
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-  allowExitOnIdle: false
+  connectionTimeoutMillis: 5000, // Увеличено с 2000
+  maxUses: 7500 // Предотвращает утечки
 });
 
 pool.on('error', (err) => {
   console.error('❌ Unexpected DB error', err);
 });
+
+// Мониторинг пула
+setInterval(() => {
+  console.log(`📊 DB Pool: total=${pool.totalCount}, idle=${pool.idleCount}, waiting=${pool.waitingCount}`);
+}, 30000);
 
 // ==========================================
 // Telegram Validation с кэшированием
@@ -178,7 +183,12 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    cacheSize: productsCache.length 
+    cacheSize: productsCache.length,
+    dbPool: {
+      total: pool.totalCount,
+      idle: pool.idleCount,
+      waiting: pool.waitingCount
+    }
   });
 });
 
@@ -522,66 +532,106 @@ app.patch('/api/orders/:id', async (req, res) => {
   }
 });
 
-// ============== PRODUCT REQUESTS ==============
+// ============== PRODUCT REQUESTS (оптимизированный с фоновой обработкой) ==============
 
 app.post('/api/product-requests', async (req, res) => {
+  const start = Date.now();
   const { user_id, product_name, quantity, image, init_data } = req.body;
+  
   console.log('📦 Product request received:', { 
     user_id, 
-    product_name, 
-    quantity, 
-    image,
-    has_init_data: !!init_data
+    product_name: product_name?.substring(0, 30),
+    quantity 
   });
-  
-  if (!user_id || !product_name || !quantity) {
+
+  // 1. Быстрая валидация данных
+  if (!user_id || !product_name?.trim() || !quantity) {
     console.error('❌ Missing required fields');
     return res.status(400).json({ error: 'Missing required fields' });
   }
-  
+
+  // 2. Валидация Telegram (с кэшированием)
+  const validationStart = Date.now();
   const { valid, user: tgUser } = validateTelegramData(init_data);
+  const validationTime = Date.now() - validationStart;
   
-  console.log('🔐 Telegram validation:', valid ? '✅ Valid' : '❌ Invalid');
+  if (validationTime > 200) {
+    console.warn(`⚠️ Slow Telegram validation: ${validationTime}ms`);
+  }
   
   if (!valid && process.env.NODE_ENV !== 'development') {
-    console.error('❌ Invalid Telegram data in product request');
+    console.error('❌ Invalid Telegram data');
     return res.status(401).json({ error: 'Invalid Telegram data' });
   }
-  
-  try {
-    const userResult = await pool.query('SELECT username FROM users WHERE id = $1', [user_id]);
-    
-    if (userResult.rows.length === 0) {
-      console.error('❌ User not found:', user_id);
-      return res.status(404).json({ error: 'User not found' });
+
+  // 3. Быстрый ответ клиенту (уменьшаем perceived latency)
+  res.json({
+    success: true,
+    message: 'Запрос отправлен администратору',
+    timestamp: Date.now()
+  });
+
+  // 4. Фоновая обработка (не блокирует ответ)
+  setImmediate(async () => {
+    try {
+      // Проверка пользователя с таймаутом
+      const userQueryStart = Date.now();
+      const userResult = await Promise.race([
+        pool.query('SELECT username FROM users WHERE id = $1', [user_id]),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('User query timeout')), 2000)
+        )
+      ]) as pg.QueryResult;
+      
+      if (userResult.rows.length === 0) {
+        console.error('❌ User not found:', user_id);
+        return;
+      }
+
+      const username = userResult.rows[0].username;
+      
+      // Вставка запроса
+      await pool.query(
+        `INSERT INTO product_requests (user_id, username, product_name, quantity, image, status) 
+         VALUES ($1, $2, $3, $4, $5, 'pending')`,
+        [user_id, username, product_name.trim(), parseInt(quantity), image || null]
+      );
+
+      const totalTime = Date.now() - start;
+      console.log(`✅ Product request created in ${totalTime}ms: "${product_name}" (user: ${username})`);
+      
+      // 🔔 Уведомление админа через Telegram Bot API (опционально, но сильно ускоряет реакцию)
+      if (process.env.TELEGRAM_BOT_TOKEN && process.env.ADMIN_TELEGRAM_ID) {
+        notifyAdminAboutNewRequest(product_name, quantity, username);
+      }
+      
+    } catch (error) {
+      console.error('❌ Background processing failed:', error);
     }
-    
-    const username = userResult.rows[0].username;
-    console.log('👤 User found:', username);
-    
-    const result = await pool.query(
-      `INSERT INTO product_requests (user_id, username, product_name, quantity, image, status) 
-       VALUES ($1, $2, $3, $4, $5, 'pending') 
-       RETURNING *`,
-      [user_id, username, product_name, quantity, image]
-    );
-    
-    console.log(`✅ Product request created successfully:`, {
-      id: result.rows[0].id,
-      productName: product_name,
-      quantity: quantity
-    });
-    
-    res.json({
-      success: true,
-      message: 'Product request sent to admin',
-      requestId: result.rows[0].id
-    });
-  } catch (error) {
-    console.error('❌ Product request error:', error);
-    res.status(500).json({ error: 'Database error' });
-  }
+  });
 });
+
+// Функция уведомления админа
+async function notifyAdminAboutNewRequest(productName: string, quantity: number, username: string) {
+  try {
+    const message = `🆕 Новый запрос на товар!\n\n📦 ${productName}\n🔢 Количество: ${quantity}\n👤 Пользователь: ${username}`;
+    
+    await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: process.env.ADMIN_TELEGRAM_ID,
+        text: message,
+        parse_mode: 'HTML'
+      }),
+      signal: AbortSignal.timeout(3000) // Таймаут 3 сек
+    });
+    
+    console.log('🔔 Admin notified via Telegram');
+  } catch (error) {
+    console.warn('⚠️ Failed to notify admin via Telegram:', error);
+  }
+}
 
 app.get('/api/product-requests', requireAdmin, async (req, res) => {
   try {
@@ -697,4 +747,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`⚡ Cache enabled: ${CACHE_TTL}ms TTL`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`📊 DB Pool: max=${30}, min=${5}`);
 });
