@@ -15,7 +15,7 @@ const app = express();
 
 app.use(cors({
   origin: [
-    'https://frontendstore-production.up.railway.app',
+    'https://frontendstore-production.up.railway.app', // ✅ УБРАНЫ ПРОБЕЛЫ
     'http://localhost:5173', 
     'http://localhost:3000'
   ],
@@ -33,11 +33,15 @@ app.use(express.json({ limit: '10mb' }));
 let productsCache: any[] = [];
 let cacheTimestamp = 0;
 const CACHE_TTL = 30000; // 30 секунд
+const MAX_CACHE_SIZE = 200; // Максимум 200 товаров в кэше
 
 const getCachedProducts = async () => {
   const now = Date.now();
   if (now - cacheTimestamp > CACHE_TTL || productsCache.length === 0) {
-    const result = await pool.query('SELECT * FROM products ORDER BY created_at DESC LIMIT 100');
+    const result = await pool.query(
+      'SELECT * FROM products ORDER BY created_at DESC LIMIT $1',
+      [MAX_CACHE_SIZE]
+    );
     productsCache = result.rows;
     cacheTimestamp = now;
     console.log('✅ Cache updated:', productsCache.length, 'products');
@@ -50,6 +54,15 @@ const invalidateCache = () => {
   productsCache = [];
 };
 
+// Автоматическая очистка кэша
+setInterval(() => {
+  const now = Date.now();
+  if (now - cacheTimestamp > CACHE_TTL) {
+    invalidateCache();
+    console.log('🧹 Cache auto-cleared');
+  }
+}, CACHE_TTL / 2);
+
 // ==========================================
 // Database
 // ==========================================
@@ -58,8 +71,10 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   max: 20,
+  min: 2,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
+  allowExitOnIdle: false
 });
 
 pool.on('error', (err) => {
@@ -67,11 +82,20 @@ pool.on('error', (err) => {
 });
 
 // ==========================================
-// Telegram Validation
+// Telegram Validation с кэшированием
 // ==========================================
+
+const telegramValidationCache = new Map<string, { valid: boolean; user?: any; timestamp: number }>();
+const VALIDATION_CACHE_TTL = 60000; // 1 минута
 
 function validateTelegramData(initData: string): { valid: boolean; user?: any } {
   if (!initData || !process.env.BOT_TOKEN) return { valid: false };
+  
+  // Проверяем кэш
+  const cached = telegramValidationCache.get(initData);
+  if (cached && Date.now() - cached.timestamp < VALIDATION_CACHE_TTL) {
+    return cached;
+  }
   
   try {
     const params = new URLSearchParams(initData);
@@ -90,11 +114,26 @@ function validateTelegramData(initData: string): { valid: boolean; user?: any } 
     const checkHash = crypto.createHmac('sha256', secretKey)
       .update(dataCheckString).digest('hex');
       
-    if (!crypto.timingSafeEqual(Buffer.from(checkHash), Buffer.from(hash))) {
-      return { valid: false };
+    const isValid = crypto.timingSafeEqual(Buffer.from(checkHash), Buffer.from(hash));
+    const result = {
+      valid: isValid,
+      user: isValid ? JSON.parse(params.get('user') || '{}') : undefined,
+      timestamp: Date.now()
+    };
+    
+    telegramValidationCache.set(initData, result);
+    
+    // Очистка старого кэша
+    if (telegramValidationCache.size > 1000) {
+      const now = Date.now();
+      for (const [key, value] of telegramValidationCache.entries()) {
+        if (now - value.timestamp > VALIDATION_CACHE_TTL) {
+          telegramValidationCache.delete(key);
+        }
+      }
     }
     
-    return { valid: true, user: JSON.parse(params.get('user') || '{}') };
+    return result;
   } catch (error) {
     console.error('❌ Telegram validation error:', error);
     return { valid: false };
@@ -214,7 +253,6 @@ app.delete('/api/products/:id', requireAdmin, async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Обновление товара БЕЗ колонки updated_at
 app.patch('/api/products/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, price, image, description, category, quantity } = req.body;
@@ -225,8 +263,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     image: !!image, 
     description: !!description, 
     category, 
-    quantity,
-    has_init_data: !!req.body.init_data // ✅ ИСПРАВЛЕНО: добавлена недостающая запятая
+    quantity
   });
   
   try {
@@ -268,7 +305,6 @@ app.patch('/api/products/:id', requireAdmin, async (req, res) => {
     
     values.push(id);
     
-    // ✅ УБРАНО: updated_at = NOW() (колонки нет в таблице)
     const query = `
       UPDATE products 
       SET ${fields.join(', ')} 
@@ -348,12 +384,10 @@ app.get('/api/orders/user/:userId', async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Улучшенный error handling для создания заказа + логика с quantity
 app.post('/api/orders', async (req, res) => {
   const { user_id, items, total_amount, init_data } = req.body;
   console.log('📦 Order request:', { user_id, itemsCount: items?.length, total_amount });
   
-  // Валидация входных данных
   if (!user_id || !items || !Array.isArray(items) || items.length === 0) {
     console.error('❌ Invalid order data');
     return res.status(400).json({ error: 'Invalid order data' });
@@ -371,7 +405,6 @@ app.post('/api/orders', async (req, res) => {
     await client.query('BEGIN');
     console.log('🔄 Transaction started');
     
-    // 1. Создаем заказ
     const orderResult = await client.query(
       'INSERT INTO orders (user_id, total_amount, status) VALUES ($1, $2, $3) RETURNING *',
       [user_id, total_amount, 'PENDING']
@@ -379,7 +412,6 @@ app.post('/api/orders', async (req, res) => {
     const orderId = orderResult.rows[0].id;
     console.log('✅ Order created:', orderId);
     
-    // 2. Сохраняем items с image_data
     for (const item of items) {
       await client.query(
         'INSERT INTO order_items (order_id, product_id, product_name, quantity, price, image_data) VALUES ($1, $2, $3, $4, $5, $6)',
@@ -388,7 +420,6 @@ app.post('/api/orders', async (req, res) => {
     }
     console.log('✅ Order items saved:', items.length);
     
-    // 3. Уменьшаем quantity товаров (НОВАЯ ЛОГИКА)
     for (const item of items) {
       const productResult = await client.query(
         'SELECT quantity FROM products WHERE id = $1 FOR UPDATE',
@@ -403,11 +434,9 @@ app.post('/api/orders', async (req, res) => {
       const newQuantity = currentQuantity - item.quantity;
       
       if (newQuantity <= 0) {
-        // Удаляем товар если количество <= 0
         await client.query('DELETE FROM products WHERE id = $1', [item.id]);
         console.log(`🗑️ Product ${item.id} deleted (quantity reached 0)`);
       } else {
-        // Уменьшаем количество
         await client.query(
           'UPDATE products SET quantity = $1 WHERE id = $2',
           [newQuantity, item.id]
@@ -419,7 +448,6 @@ app.post('/api/orders', async (req, res) => {
     await client.query('COMMIT');
     console.log('✅ Transaction committed');
     
-    // 4. Инвалидируем кэш продуктов
     invalidateCache();
     
     console.log(`🎉 Order ${orderId} created successfully`);
@@ -427,10 +455,6 @@ app.post('/api/orders', async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('❌ Order creation failed:', error);
-    console.error('Error details:', {
-      message: (error as Error).message,
-      stack: (error as Error).stack
-    });
     res.status(500).json({ 
       error: 'Failed to create order',
       details: process.env.NODE_ENV === 'development' ? (error as Error).message : undefined
@@ -440,7 +464,6 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Обновление статуса заказа
 app.patch('/api/orders/:id', async (req, res) => {
   const { id } = req.params;
   const { status, init_data, user_id } = req.body;
@@ -458,7 +481,6 @@ app.patch('/api/orders/:id', async (req, res) => {
   try {
     await client.query('BEGIN');
     
-    // Получаем текущий заказ
     const orderCheck = await client.query('SELECT id, user_id, status, total_amount FROM orders WHERE id = $1', [id]);
     if (orderCheck.rows.length === 0) {
       await client.query('ROLLBACK');
@@ -471,22 +493,16 @@ app.patch('/api/orders/:id', async (req, res) => {
       tgUser?.id?.toString() === process.env.ADMIN_TELEGRAM_ID;
     const isOwner = order.user_id.toString() === user_id?.toString();
     
-    // Пользователь может только отменить свой PENDING заказ
-    // Админ может менять статус на любой
     if (!isAdmin && (!isOwner || order.status !== 'PENDING' || status !== 'CANCELED')) {
       await client.query('ROLLBACK');
       console.error('❌ Forbidden order update');
       return res.status(403).json({ error: 'Forbidden' });
     }
     
-    // Обновляем статус заказа
     const result = await client.query(
       'UPDATE orders SET status = $1 WHERE id = $2 RETURNING *',
       [status, id]
     );
-    
-    // ✅ УДАЛЕНО: Создание уведомлений
-    console.log(`🔔 Order ${id} status changed to ${status} for user ${order.user_id}`);
     
     await client.query('COMMIT');
     
@@ -508,7 +524,6 @@ app.patch('/api/orders/:id', async (req, res) => {
 
 // ============== PRODUCT REQUESTS ==============
 
-// Создание запроса на товар
 app.post('/api/product-requests', async (req, res) => {
   const { user_id, product_name, quantity, image, init_data } = req.body;
   console.log('📦 Product request received:', { 
@@ -519,7 +534,6 @@ app.post('/api/product-requests', async (req, res) => {
     has_init_data: !!init_data
   });
   
-  // Проверяем наличие данных
   if (!user_id || !product_name || !quantity) {
     console.error('❌ Missing required fields');
     return res.status(400).json({ error: 'Missing required fields' });
@@ -535,7 +549,6 @@ app.post('/api/product-requests', async (req, res) => {
   }
   
   try {
-    // Получаем информацию о пользователе
     const userResult = await pool.query('SELECT username FROM users WHERE id = $1', [user_id]);
     
     if (userResult.rows.length === 0) {
@@ -546,7 +559,6 @@ app.post('/api/product-requests', async (req, res) => {
     const username = userResult.rows[0].username;
     console.log('👤 User found:', username);
     
-    // Сохраняем запрос в базу данных
     const result = await pool.query(
       `INSERT INTO product_requests (user_id, username, product_name, quantity, image, status) 
        VALUES ($1, $2, $3, $4, $5, 'pending') 
@@ -571,7 +583,6 @@ app.post('/api/product-requests', async (req, res) => {
   }
 });
 
-// ✅ ИСПРАВЛЕНО: Добавлен try и стрелка =>
 app.get('/api/product-requests', requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -599,7 +610,6 @@ app.get('/api/product-requests', requireAdmin, async (req, res) => {
   }
 });
 
-// Получение запросов конкретного пользователя
 app.get('/api/product-requests/user/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -635,7 +645,6 @@ app.get('/api/product-requests/user/:userId', async (req, res) => {
   }
 });
 
-// Обработка запроса (одобрение/отклонение)
 app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { status, init_data } = req.body;
@@ -649,7 +658,6 @@ app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
   }
   
   try {
-    // Получаем информацию о запросе
     const requestResult = await pool.query(
       'SELECT user_id, product_name, quantity FROM product_requests WHERE id = $1',
       [id]
@@ -661,7 +669,6 @@ app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
     
     const request = requestResult.rows[0];
     
-    // Обновляем статус
     const result = await pool.query(
       `UPDATE product_requests 
        SET status = $1, processed_at = NOW() 
@@ -672,8 +679,6 @@ app.patch('/api/product-requests/:id', requireAdmin, async (req, res) => {
     
     console.log(`✅ Product request ${id} ${status === 'approved' ? 'approved' : 'rejected'}`);
     
-    // Здесь можно добавить уведомление пользователю
-    // (пока просто логируем)
     console.log(`🔔 User ${request.user_id} should be notified about ${status} request for "${request.product_name}"`);
     
     res.json(result.rows[0]);
